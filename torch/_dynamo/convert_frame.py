@@ -43,7 +43,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import CellType, CodeType, FunctionType, ModuleType
 from typing import Any, Callable, Optional, TypeVar, Union
-from typing_extensions import ParamSpec
 from weakref import ReferenceType
 
 import torch
@@ -73,6 +72,7 @@ from torch.utils._python_dispatch import (
     is_in_torch_dispatch_mode,
 )
 from torch.utils._traceback import CapturedTraceback, format_traceback_short
+from typing_extensions import ParamSpec
 
 from . import config, decorators, exc, graph_break_hints, trace_rules
 from .bytecode_analysis import remove_dead_code, remove_pointless_jumps
@@ -103,6 +103,7 @@ from .exc import (
     InternalTorchDynamoError,
     PackageError,
     RecompileLimitExceeded,
+    ResumePrologueTracingError,
     ShortenTraceback,
     SkipCodeRecursiveException,
     TorchRuntimeError,
@@ -269,9 +270,9 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
                 return fn(*args, **kwargs)
             finally:
                 cleanup.close()
-                assert torch._C._len_torch_function_stack() == 0, (
-                    "Torch function mode stack state changed while dynamo tracing, please report a bug"
-                )
+                assert (
+                    torch._C._len_torch_function_stack() == 0
+                ), "Torch function mode stack state changed while dynamo tracing, please report a bug"
                 exit_stack.close()
                 torch._C._set_grad_enabled(prior_grad_mode)
                 torch.autograd.grad_mode._enter_inference_mode(prior_inference_mode)
@@ -290,9 +291,9 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
                     torch.cuda.set_rng_state(cuda_rng_state)
                 torch._C._set_cublas_allow_tf32(allow_tf32)
                 torch.fx.graph_module._forward_from_src = prior_fwd_from_src
-                assert guards.check(), (
-                    f"Global {guards.reason()}state changed while dynamo tracing, please report a bug"
-                )
+                assert (
+                    guards.check()
+                ), f"Global {guards.reason()}state changed while dynamo tracing, please report a bug"
 
     _fn._torchdynamo_orig_callable = fn  # type: ignore[attr-defined]
     return _fn
@@ -477,6 +478,12 @@ def cprofile_wrapper(func: Callable[_P, _T]) -> Callable[_P, _T]:
 @dataclass
 class ConvertFrameBox:
     error_on_graph_break: Optional[bool] = None
+
+
+def _is_error_on_graph_break(tx: Optional[InstructionTranslator]) -> bool:
+    if tx is None:
+        return _get_error_on_graph_break()
+    return tx.error_on_graph_break
 
 
 class ConvertFrameAssert:
@@ -874,12 +881,7 @@ def _compile(
                     code.co_filename,
                     code.co_firstlineno,
                 )
-                error_on_graph_break = (
-                    tracer.error_on_graph_break
-                    if tracer
-                    else _get_error_on_graph_break()
-                )
-                if one_graph or error_on_graph_break:
+                if one_graph or _is_error_on_graph_break(tracer):
                     log.debug(
                         "No graph captured with one_graph=True or error_on_graph_break=True"
                     )
@@ -1044,14 +1046,11 @@ def _compile(
                 recompile_reason,
                 troubleshooting_url,
             )
-            error_on_graph_break = (
-                tracer.error_on_graph_break if tracer else _get_error_on_graph_break()
-            )
             if config.fail_on_recompile_limit_hit:
                 raise FailOnRecompileLimitHit(
                     f"{limit_type} reached, because fail_on_recompile_limit_hit = True this is a HARD failure"
                 )
-            elif one_graph or error_on_graph_break:
+            elif one_graph or _is_error_on_graph_break(tracer):
                 raise FailOnRecompileLimitHit(
                     f"{limit_type} reached with one_graph=True or error_on_graph_break=True. "
                     "Excessive recompilations can degrade "
@@ -1165,7 +1164,15 @@ def _compile(
             fail_user_frame_filename, fail_user_frame_lineno = exc.get_exc_message(
                 e, compile_id
             )
-            if isinstance(
+            if tracer and tracer.is_tracing_resume_prologue:
+                # Do not allow any errors to be suppressed if tracer is currently tracing
+                # through resume function.
+                raise ResumePrologueTracingError(
+                    "Error while tracing through a Dynamo-generated resume function prologue. "
+                    "Errors are not allowed when tracing resume function prologues.\n"
+                    f"{type(e).__qualname__}: {str(e)}"
+                ).with_traceback(e.__traceback__) from None
+            elif isinstance(
                 e,
                 (
                     Unsupported,
@@ -1312,6 +1319,10 @@ class ConvertFrame:
             counters["frames"]["ok"] += 1
             return result
         except Exception as e:
+            # Do not allow errors to be suppressed if we're tracing a resume function prologue
+            if isinstance(e, ResumePrologueTracingError):
+                raise
+
             error_on_graph_break = (
                 self._inner_convert._box.error_on_graph_break is not None
             )
@@ -1530,9 +1541,7 @@ class CatchErrorsWrapper:
                     )
                     assert hasattr(
                         self._torchdynamo_orig_callable, "_clone_with_backend"
-                    ), (
-                        "DDPOptimizer only supports callback fns that know how to clone themselves."
-                    )
+                    ), "DDPOptimizer only supports callback fns that know how to clone themselves."
                     hijacked_callback = (
                         self._torchdynamo_orig_callable._clone_with_backend(
                             ddp_optimizer.compile_fn,
