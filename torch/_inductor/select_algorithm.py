@@ -2204,6 +2204,7 @@ class AlgorithmSelectorCache(PersistentCache):
         # Run preprocessing functions on choices
         for preprocessing_fn in self.preprocessing_fns:
             choices = preprocessing_fn(choices)
+            assert choices is not None, "Preprocessing function returned None"
 
         # Templates selected with input_gen_fns require specific input data to avoid IMA
         # Passing custom input gen fns to benchmark_fusion NYI, so skip deferred template selection
